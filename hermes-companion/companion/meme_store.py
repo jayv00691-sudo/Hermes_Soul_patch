@@ -1,0 +1,214 @@
+import hashlib
+import json
+import os
+from datetime import datetime, timezone
+from pathlib import Path
+
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+DEFAULT_PACK_ID = "builtin-default"
+
+
+def _safe_category_name(raw: str) -> str:
+    name = str(raw or "").strip()
+    if not name or name in {".", ".."}:
+        raise ValueError("分类名不能为空")
+    if "/" in name or "\\" in name:
+        raise ValueError("分类名不能包含路径分隔符")
+    if Path(name).name != name:
+        raise ValueError("分类名包含非法路径")
+    return name
+
+
+class MemeManager:
+    """轻量版表情包管理器：实现 AstrBot 式的分类 + 存储 + 去重。"""
+
+    def __init__(self, hermes_home: str | os.PathLike[str] | None = None):
+        base = (
+            hermes_home
+            if hermes_home is not None
+            else os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))
+        )
+        self.hermes_home = Path(base).expanduser().resolve()
+        self.root = self.hermes_home / "companion" / "memes"
+        self.registry_path = self.hermes_home / "companion" / "meme_registry.json"
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.registry_path.parent.mkdir(parents=True, exist_ok=True)
+        self._ensure_registry()
+
+    def _load_registry(self) -> dict:
+        if not self.registry_path.exists():
+            self._ensure_registry()
+        try:
+            data = json.loads(self.registry_path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+        return {"schema_version": 1, "installed_packs": [], "default_pack_id": DEFAULT_PACK_ID}
+
+    def _save_registry(self, payload: dict) -> None:
+        self.registry_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+    def _ensure_registry(self) -> None:
+        payload = self._load_registry()
+        if not payload.get("installed_packs"):
+            payload = {
+                "schema_version": 1,
+                "installed_packs": [
+                    {
+                        "id": DEFAULT_PACK_ID,
+                        "name": "Default Hermes Meme Pack",
+                        "version": "1.0.0",
+                        "enabled": True,
+                        "installed_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                ],
+                "default_pack_id": DEFAULT_PACK_ID,
+            }
+        elif not payload.get("default_pack_id"):
+            payload["default_pack_id"] = DEFAULT_PACK_ID
+        self._save_registry(payload)
+        self.ensure_pack(DEFAULT_PACK_ID)
+
+    @property
+    def default_pack_id(self) -> str:
+        registry = self._load_registry()
+        pack_id = str(registry.get("default_pack_id") or DEFAULT_PACK_ID).strip()
+        if not pack_id:
+            pack_id = DEFAULT_PACK_ID
+        self.ensure_pack(pack_id)
+        return pack_id
+
+    def ensure_pack(self, pack_id: str) -> Path:
+        pack_name = str(pack_id or DEFAULT_PACK_ID).strip() or DEFAULT_PACK_ID
+        pack_dir = self.root / pack_name
+        pack_dir.mkdir(parents=True, exist_ok=True)
+        memes_dir = pack_dir / "memes"
+        memes_dir.mkdir(parents=True, exist_ok=True)
+        return memes_dir
+
+    def get_default_memes_dir(self) -> Path:
+        return self.ensure_pack(self.default_pack_id)
+
+    def scan_categories(self, pack_id: str | None = None) -> dict[str, list[str]]:
+        memes_dir = self.ensure_pack(pack_id or self.default_pack_id)
+        result: dict[str, list[str]] = {}
+        if not memes_dir.exists():
+            return result
+        for child in sorted(memes_dir.iterdir(), key=lambda p: p.name):
+            if not child.is_dir():
+                continue
+            images = sorted(
+                p.name
+                for p in child.iterdir()
+                if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
+            )
+            if images:
+                result[child.name] = images
+        return result
+
+    def get_meme_path(self, category: str, filename: str) -> Path:
+        category_name = _safe_category_name(category)
+        memes_dir = self.get_default_memes_dir()
+        safe_filename = Path(str(filename or "")).name
+        path = (memes_dir / category_name / safe_filename).resolve()
+        try:
+            path.relative_to(memes_dir.resolve())
+        except ValueError as exc:
+            raise ValueError(f"非法表情路径: {category_name}/{safe_filename}") from exc
+        return path
+
+    @staticmethod
+    def _hash_bytes(content: bytes) -> str:
+        return hashlib.sha256(content).hexdigest()
+
+    def _unique_path(self, category_dir: Path, filename: str) -> Path:
+        base = Path(filename)
+        if not base.name:
+            base = Path("meme.png")
+        candidate = category_dir / base.name
+        if not candidate.exists():
+            return candidate
+        stem = base.stem
+        suffix = base.suffix.lower() or ".png"
+        index = 1
+        while True:
+            new_path = category_dir / f"{stem}_{index}{suffix}"
+            if not new_path.exists():
+                return new_path
+            index += 1
+
+    def add_meme(self, category: str, filename: str, content: bytes) -> dict:
+        category_name = _safe_category_name(category)
+        memes_dir = self.get_default_memes_dir()
+        category_dir = (memes_dir / category_name).resolve()
+        category_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            category_dir.relative_to(memes_dir.resolve())
+        except ValueError as exc:
+            raise ValueError(f"分类目录越界: {category_name}") from exc
+
+        if not filename:
+            filename = "meme.png"
+        file_name = Path(str(filename)).name
+        if not file_name:
+            file_name = "meme.png"
+        suffix = Path(file_name).suffix.lower()
+        if suffix not in IMAGE_EXTENSIONS:
+            raise ValueError(f"不支持的图片扩展名: {suffix or '空'}")
+
+        content_hash = self._hash_bytes(content)
+        for item in category_dir.iterdir():
+            if not item.is_file() or item.suffix.lower() not in IMAGE_EXTENSIONS:
+                continue
+            try:
+                if self._hash_bytes(item.read_bytes()) == content_hash:
+                    raise ValueError(f"同一分类中已存在相同内容的文件: {item.name}")
+            except Exception:
+                continue
+
+        destination = self._unique_path(category_dir, file_name)
+        destination.write_bytes(content)
+        return {"category": category_name, "filename": destination.name, "path": str(destination)}
+
+    def remove_meme(self, category: str, filename: str) -> bool:
+        try:
+            path = self.get_meme_path(category, filename)
+        except ValueError:
+            return False
+        if not path.exists() or not path.is_file():
+            return False
+        path.unlink()
+        return True
+
+    def format_prompt_block(self) -> str:
+        categories = self.scan_categories()
+        if not categories:
+            return ""
+        lines = ["[表情包可用分类]"]
+        for category, files in sorted(categories.items()):
+            preview = ", ".join(files[:3]) if files else "无"
+            lines.append(f"- {category}: {len(files)} 张（示例: {preview}）")
+        lines.append("需要插入图片时，请在回复末尾用 &&分类名:文件名&& 标记，例如 &&happy:smile.png&&")
+        return "\n".join(lines)
+
+    def extract_markers(self, text: str) -> list[tuple[str, str]]:
+        if not text:
+            return []
+        import re
+        return re.findall(r"&&([A-Za-z0-9_\-]+):([A-Za-z0-9_.\-]+)&&", text)
+
+
+_meme_manager: MemeManager | None = None
+
+
+def get_meme_manager() -> MemeManager:
+    global _meme_manager
+    if _meme_manager is None:
+        _meme_manager = MemeManager()
+    return _meme_manager
+
+
+__all__ = ["MemeManager", "IMAGE_EXTENSIONS", "get_meme_manager", "DEFAULT_PACK_ID"]
