@@ -1,14 +1,17 @@
 """
 Companion slash commands.
 
-  /mood              显示当前情感状态
-  /mood-set ...      手动设置情感状态（调试）
-  /heartbeat         显示主动消息队列状态 + 控制 / 触发心跳
-  /agenda            显示今日事件列表（世界状态模拟器，见 core.md §4.8）
-  /agenda-add ...    添加事件
-  /agenda-done <id>  标记事件完成
-  /agenda-ambient    追加一条环境事件
-  /recall <date>     调取某日归档摘要
+   /mood              显示当前情感状态
+   /mood-set ...      手动设置情感状态（调试）
+   /heartbeat         显示主动消息队列状态 + 控制 / 触发心跳
+   /agenda            显示今日事件列表（世界状态模拟器，见 core.md §4.8）
+   /agenda-add ...    添加事件
+   /agenda-done <id>  标记事件完成
+   /agenda-ambient    追加一条环境事件
+   /recall <date>     调取某日归档摘要
+   /meme-list         列出当前表情包分类和图片
+   /meme-add <cat> <url> 下载并加入表情包
+   /meme-del <cat> <name> 删除表情
 
 handler 签名约定（hermes_cli/plugins.py）：fn(raw_args: str, **kw) -> str | None
 """
@@ -18,9 +21,12 @@ from __future__ import annotations
 import logging
 import shlex
 from datetime import datetime
+from pathlib import Path
+from urllib.request import Request, urlopen
 
 from companion.emotion_state import load_emotion_state, update_emotion
 from companion.heartbeat import enqueue, queue_path
+from companion.meme_store import get_meme_manager
 from companion.world_state import (
     add_ambient,
     add_event,
@@ -77,32 +83,112 @@ def cmd_heartbeat(raw_args: str = "", **kwargs) -> str:
     return f"队列中有 {n} 条待注入消息（{qp}）。"
 
 
+def cmd_meme_list(raw_args: str = "", **_kw) -> str:
+    try:
+        manager = get_meme_manager()
+        categories = manager.scan_categories()
+        if not categories:
+            return "当前表情包为空。可用 /meme-add <category> <url> 导入图片。"
+        lines = ["# 表情包列表"]
+        for category, files in sorted(categories.items()):
+            lines.append(f"- {category}: {len(files)} 张")
+            for file_name in files[:5]:
+                lines.append(f"    · {file_name}")
+            if len(files) > 5:
+                lines.append(f"    · ... 还有 {len(files)-5} 张")
+        return "\n".join(lines)
+    except Exception as exc:  # pragma: no cover
+        logger.warning("meme-list failed: %s", exc)
+        return f"读取表情包失败：{exc}"
+
+
+def cmd_meme_add(raw_args: str = "", **_kw) -> str:
+    parts = shlex.split(raw_args or "")
+    if len(parts) < 2:
+        return "用法: /meme-add <category> <image_url>"
+    category, url = parts[0], parts[1]
+    try:
+        req = Request(url, headers={"User-Agent": "HermesCompanion/1.0"})
+        with urlopen(req, timeout=20) as resp:
+            payload = resp.read()
+        if not payload:
+            return "下载失败：空内容"
+        file_name = Path(url.split("?", 1)[0]).name or "meme.png"
+        manager = get_meme_manager()
+        result = manager.add_meme(category, file_name, payload)
+        return f"✓ 已添加表情：{result['category']}/{result['filename']}"
+    except Exception as exc:  # pragma: no cover
+        logger.warning("meme-add failed: %s", exc)
+        return f"添加失败：{exc}"
+
+
+def cmd_meme_del(raw_args: str = "", **_kw) -> str:
+    parts = shlex.split(raw_args or "")
+    if len(parts) < 2:
+        return "用法: /meme-del <category> <filename>"
+    category, filename = parts[0], parts[1]
+    try:
+        manager = get_meme_manager()
+        ok = manager.remove_meme(category, filename)
+        return "✓ 已删除表情" if ok else f"未找到 {category}/{filename}"
+    except Exception as exc:  # pragma: no cover
+        logger.warning("meme-del failed: %s", exc)
+        return f"删除失败：{exc}"
+
+
 def register_commands(ctx) -> None:
-    ctx.register_command("mood", cmd_mood_show,
-                         description="显示当前情感状态")
-    ctx.register_command("mood-set", cmd_mood_set,
-                         description="手动设置情感状态（调试）",
-                         args_hint="<valence> <arousal> <dominant> <note>")
-    ctx.register_command("heartbeat", cmd_heartbeat,
-                         description="显示/控制 companion 主动消息队列",
-                         args_hint="[push <msg>]")
-    ctx.register_command("agenda", cmd_agenda,
-                         description="显示今日事件列表")
-    ctx.register_command("agenda-add", cmd_agenda_add,
-                         description="添加事件",
-                         args_hint="<start> <end> <title> [kind]")
-    ctx.register_command("agenda-done", cmd_agenda_done,
-                         description="标记事件完成",
-                         args_hint="<event_id>")
-    ctx.register_command("agenda-ambient", cmd_agenda_ambient,
-                         description="追加一条环境事件",
-                         args_hint="<note>")
-    ctx.register_command("recall", cmd_recall,
-                         description="读取某日归档摘要",
-                         args_hint="<YYYY-MM-DD>")
+    ctx.register_command("mood", cmd_mood_show, description="显示当前情感状态")
+    ctx.register_command(
+        "mood-set",
+        cmd_mood_set,
+        description="手动设置情感状态（调试）",
+        args_hint="<valence> <arousal> <dominant> <note>",
+    )
+    ctx.register_command(
+        "heartbeat",
+        cmd_heartbeat,
+        description="显示/控制 companion 主动消息队列",
+        args_hint="[push <msg>]",
+    )
+    ctx.register_command("agenda", cmd_agenda, description="显示今日事件列表")
+    ctx.register_command(
+        "agenda-add",
+        cmd_agenda_add,
+        description="添加事件",
+        args_hint="<start> <end> <title> [kind]",
+    )
+    ctx.register_command(
+        "agenda-done",
+        cmd_agenda_done,
+        description="标记事件完成",
+        args_hint="<event_id>",
+    )
+    ctx.register_command(
+        "agenda-ambient",
+        cmd_agenda_ambient,
+        description="追加一条环境事件",
+        args_hint="<note>",
+    )
+    ctx.register_command(
+        "recall",
+        cmd_recall,
+        description="读取某日归档摘要",
+        args_hint="<YYYY-MM-DD>",
+    )
+    ctx.register_command("meme-list", cmd_meme_list, description="列出当前表情包分类和图片")
+    ctx.register_command(
+        "meme-add",
+        cmd_meme_add,
+        description="下载并加入表情包",
+        args_hint="<category> <image_url>",
+    )
+    ctx.register_command(
+        "meme-del",
+        cmd_meme_del,
+        description="删除指定表情",
+        args_hint="<category> <filename>",
+    )
 
-
-# ---------------- /agenda 系列 ----------------
 
 def cmd_agenda(raw_args: str = "", **_kw) -> str:
     """显示今日事件列表（人类可读）。"""
@@ -141,20 +227,15 @@ def cmd_agenda(raw_args: str = "", **_kw) -> str:
 
 
 def cmd_agenda_add(raw_args: str = "", **_kw) -> str:
-    """
-    /agenda-add <start> <end> <title> [kind]
-
-    时间格式：ISO（YYYY-MM-DDTHH:MM）或 HH:MM（自动补今天日期）。
-    end 可填 "-" 表示不设结束时间。
-    title 含空格请用引号包裹。kind 可选 self / interaction / ambient（默认 self）。
-    """
     try:
         parts = shlex.split(raw_args or "")
     except ValueError as e:
         return f"参数解析失败：{e}"
     if len(parts) < 3:
-        return ("用法: /agenda-add <start> <end> <title> [kind]\n"
-                "示例: /agenda-add 14:00 15:00 \"和 Jifeng 讨论\" interaction")
+        return (
+            "用法: /agenda-add <start> <end> <title> [kind]\n"
+            "示例: /agenda-add 14:00 15:00 \"和 Jifeng 讨论\" interaction"
+        )
 
     start = _normalize_time(parts[0])
     end_raw = parts[1]
@@ -199,7 +280,6 @@ def cmd_recall(raw_args: str = "", **_kw) -> str:
 
 
 def _normalize_time(s: str) -> str:
-    """HH:MM → 今天 ISO；其它原样返回让 add_event 校验。"""
     s = s.strip()
     if "T" in s or len(s) >= 10:
         return s

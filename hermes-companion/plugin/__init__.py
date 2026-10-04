@@ -1,8 +1,4 @@
-"""
-Hermes Companion 插件注册入口（v0.2 完整版：时间 + 情感 + 主动消息 + v0.4 推断 + 表情包管理）。
-
-Hermes 自动发现 ~/.hermes/plugins/hermes-companion/ 并调用 register(ctx)。
-"""
+"""Hermes companion plugin entrypoint with meme support."""
 
 from __future__ import annotations
 
@@ -39,7 +35,6 @@ def _truthy_env(name: str) -> bool:
 
 
 def _cron_delivery_enabled() -> bool:
-    """Return True when Hermes cron is already responsible for Telegram heartbeat."""
     if _truthy_env("HERMES_COMPANION_HEARTBEAT_FORCE"):
         return False
 
@@ -72,16 +67,16 @@ def _start_heartbeat_thread(ctx) -> None:
         ok = False
         try:
             ok = bool(ctx.inject_message(msg, role="user"))
-        except Exception as e:
-            logger.warning("inject_message error: %s", e)
+        except Exception as exc:
+            logger.warning("inject_message error: %s", exc)
         if ok:
             logger.info("heartbeat injected message")
             return
         try:
             enqueue(msg)
             logger.info("heartbeat fallback to queue: %s", queue_path())
-        except Exception as e:
-            logger.warning("enqueue fallback failed: %s", e)
+        except Exception as exc:
+            logger.warning("enqueue fallback failed: %s", exc)
 
     def _loop() -> None:
         logger.info("companion heartbeat thread started (interval=%ds)", interval)
@@ -90,8 +85,8 @@ def _start_heartbeat_thread(ctx) -> None:
             try:
                 for msg in collect_heartbeat_messages():
                     _emit(msg)
-            except Exception as e:
-                logger.warning("heartbeat tick error: %s", e)
+            except Exception as exc:
+                logger.warning("heartbeat tick error: %s", exc)
             time.sleep(interval)
 
     t = threading.Thread(target=_loop, daemon=True, name="companion-heartbeat")
@@ -104,24 +99,22 @@ def register(ctx) -> None:
 
     try:
         from companion.meme_store import get_meme_manager
-
         manager = get_meme_manager()
         manager.ensure_pack(manager.default_pack_id)
         logger.info("meme manager ready: %s", manager.get_default_memes_dir())
-    except Exception as e:
-        logger.warning("meme manager init failed: %s", e)
+    except Exception as exc:
+        logger.warning("meme manager init failed: %s", exc)
 
     try:
         register_tools(ctx)
-    except Exception as e:
-        logger.warning("agenda 工具注册失败: %s", e)
+    except Exception as exc:
+        logger.warning("agenda 工具注册失败: %s", exc)
 
     try:
         from companion.world_state import start_daily_archiver
-
         start_daily_archiver()
-    except Exception as e:
-        logger.warning("daily archiver 启动失败: %s", e)
+    except Exception as exc:
+        logger.warning("daily archiver 启动失败: %s", exc)
 
     if _heartbeat_enabled():
         try:
@@ -129,5 +122,5 @@ def register(ctx) -> None:
                 logger.info("companion heartbeat thread skipped: cron delivery is configured")
             else:
                 _start_heartbeat_thread(ctx)
-        except Exception as e:
-            logger.warning("heartbeat 线程启动失败: %s", e)
+        except Exception as exc:
+            logger.warning("heartbeat 线程启动失败: %s", exc)

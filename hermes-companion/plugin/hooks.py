@@ -1,3 +1,5 @@
+"""Hermes companion hooks."""
+
 from __future__ import annotations
 
 import json
@@ -6,15 +8,20 @@ import logging
 from companion.emotion_inference import schedule_inference
 from companion.emotion_state import load_emotion_state, nudge_emotion
 from companion.heartbeat import drain_pending
+from companion.meme_renderer import emit_meme_payload
 from companion.meme_store import get_meme_manager
 from companion.time_context import format_current_time
 from companion.world_interaction import observe_interaction
 from companion.world_state import format_today_brief, roll_over_if_new_day
 
 logger = logging.getLogger(__name__)
+CURRENT_CTX = None
 
 
-# --- pre_llm_call -----------------------------------------------------------
+def set_runtime_ctx(ctx) -> None:
+    global CURRENT_CTX
+    CURRENT_CTX = ctx
+
 
 def on_pre_llm_call(
     *,
@@ -27,41 +34,38 @@ def on_pre_llm_call(
     sender_id: str = "",
     **kwargs,
 ) -> dict:
-    """返回 {\"context\": ...}，被 append 到当前 turn 的 user message 末尾。"""
     parts: list[str] = [format_current_time()]
 
     try:
         parts.append(f"[Companion状态]\n{load_emotion_state()}")
-    except Exception as e:
-        logger.warning("emotion 注入失败: %s", e)
+    except Exception as exc:
+        logger.warning("emotion 注入失败: %s", exc)
 
     try:
         roll_over_if_new_day()
         brief = format_today_brief()
         if brief:
             parts.append(f"[今日日程]\n{brief}")
-    except Exception as e:
-        logger.warning("world_state 注入失败: %s", e)
+    except Exception as exc:
+        logger.warning("world_state 注入失败: %s", exc)
 
     try:
         pending = drain_pending()
         if pending:
             parts.append(f"[Companion主动消息]\n{pending}")
-    except Exception as e:
-        logger.warning("pending 注入失败: %s", e)
+    except Exception as exc:
+        logger.warning("pending 注入失败: %s", exc)
 
     try:
         manager = get_meme_manager()
         meme_block = manager.format_prompt_block()
         if meme_block:
             parts.append(meme_block)
-    except Exception as e:
-        logger.warning("meme 注入失败: %s", e)
+    except Exception as exc:
+        logger.warning("meme 注入失败: %s", exc)
 
     return {"context": "\n\n".join(parts)}
 
-
-# --- post_llm_call (v0.4 emotion inference) ---------------------------------
 
 def on_post_llm_call(
     *,
@@ -73,15 +77,14 @@ def on_post_llm_call(
     platform: str = "",
     **kwargs,
 ) -> None:
-    """每 turn 完成后异步推断情感状态更新。永不阻塞。"""
     try:
         schedule_inference(
             user_message=user_message,
             assistant_response=assistant_response,
             conversation_history=conversation_history,
         )
-    except Exception as e:
-        logger.warning("schedule_inference 失败: %s", e)
+    except Exception as exc:
+        logger.warning("schedule_inference 失败: %s", exc)
 
     try:
         observe_interaction(
@@ -89,19 +92,15 @@ def on_post_llm_call(
             assistant_response=assistant_response,
             conversation_history=conversation_history,
         )
-    except Exception as e:
-        logger.warning("world_interaction 失败: %s", e)
+    except Exception as exc:
+        logger.warning("world_interaction 失败: %s", exc)
 
     try:
-        manager = get_meme_manager()
-        markers = manager.extract_markers(assistant_response)
-        if markers:
-            logger.info("detected meme markers: %s", markers)
-    except Exception as e:
-        logger.warning("meme marker parse failed: %s", e)
+        if CURRENT_CTX is not None:
+            emit_meme_payload(CURRENT_CTX, assistant_response)
+    except Exception as exc:
+        logger.warning("meme payload emit failed: %s", exc)
 
-
-# --- post_tool_call ---------------------------------------------------------
 
 def _result_has_error(result) -> bool:
     if result is None:
@@ -143,17 +142,16 @@ def on_post_tool_call(
             note=f"工具 {tool_name} 执行失败。",
             source="tool_failure",
         )
-    except Exception as e:
-        logger.warning("emotion nudge 失败: %s", e)
+    except Exception as exc:
+        logger.warning("emotion nudge 失败: %s", exc)
 
-
-# --- on_session_start -------------------------------------------------------
 
 def on_session_start(*, session_id: str = "", platform: str = "", **kwargs) -> None:
     logger.info("companion: session_start sid=%s platform=%s", session_id, platform)
 
 
 def register_hooks(ctx) -> None:
+    set_runtime_ctx(ctx)
     ctx.register_hook("pre_llm_call", on_pre_llm_call)
     ctx.register_hook("post_llm_call", on_post_llm_call)
     ctx.register_hook("post_tool_call", on_post_tool_call)
