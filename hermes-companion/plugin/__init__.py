@@ -1,22 +1,7 @@
 """
-Hermes Companion 插件注册入口（v0.2 完整版：时间 + 情感 + 主动消息 + v0.4 推断）。
+Hermes Companion 插件注册入口（v0.2 完整版：时间 + 情感 + 主动消息 + v0.4 推断 + 表情包管理）。
 
 Hermes 自动发现 ~/.hermes/plugins/hermes-companion/ 并调用 register(ctx)。
-
-启用的能力：
-  - pre_llm_call    每 turn 注入时间 / 情感状态 / 待发主动消息
-  - post_llm_call   每 turn 完成后异步推断情感更新（v0.4）
-  - post_tool_call  工具失败时小幅下调 valence
-  - on_session_start 仅日志
-  - slash 命令      /mood  /mood-set  /heartbeat
-  - 后台 heartbeat 线程（策略 1：直接调 ctx.inject_message()，CLI 模式无延迟）
-
-环境变量：
-  HERMES_COMPANION_INFERENCE=0          关闭情感推断
-  HERMES_COMPANION_INFERENCE_INTERVAL   推断最小间隔（秒，默认 60）
-  HERMES_COMPANION_HEARTBEAT=0          关闭插件内 heartbeat 线程
-  HERMES_COMPANION_HEARTBEAT_INTERVAL   心跳检查间隔（秒，默认 300）
-  HERMES_COMPANION_AROUSAL_THRESHOLD    触发主动消息的 arousal 阈值（默认 0.75）
 """
 
 from __future__ import annotations
@@ -29,21 +14,23 @@ import threading
 import time
 from pathlib import Path
 
-# 把仓库根目录加入 sys.path，让 `import companion.xxx` 可用
 _repo_root = Path(__file__).resolve().parent.parent
 if str(_repo_root) not in sys.path:
     sys.path.insert(0, str(_repo_root))
 
-from .commands import register_commands  # noqa: E402
-from .hooks import register_hooks  # noqa: E402
-from .tools import register_tools  # noqa: E402
+from .commands import register_commands
+from .hooks import register_hooks
+from .tools import register_tools
 
 logger = logging.getLogger(__name__)
 
 
 def _heartbeat_enabled() -> bool:
     return os.environ.get("HERMES_COMPANION_HEARTBEAT", "1").strip().lower() not in (
-        "0", "false", "no", "off"
+        "0",
+        "false",
+        "no",
+        "off",
     )
 
 
@@ -77,12 +64,6 @@ def _cron_delivery_enabled() -> bool:
 
 
 def _start_heartbeat_thread(ctx) -> None:
-    """策略 1：插件内后台线程，直接 ctx.inject_message()。
-
-    CLI/TUI 模式下可真正主动插入消息；Gateway 模式下 Hermes 当前没有 CLI
-    引用，inject_message 会返回 False，本线程会退回 pending 队列。队列只会在
-    下一次用户输入时被 pre_llm_call drain，不等价于平台主动推送。
-    """
     from companion.heartbeat import CHECK_INTERVAL, collect_heartbeat_messages, enqueue, queue_path
 
     interval = CHECK_INTERVAL
@@ -102,7 +83,7 @@ def _start_heartbeat_thread(ctx) -> None:
         except Exception as e:
             logger.warning("enqueue fallback failed: %s", e)
 
-    def _loop():
+    def _loop() -> None:
         logger.info("companion heartbeat thread started (interval=%ds)", interval)
         time.sleep(min(interval, 30))
         while True:
@@ -120,17 +101,28 @@ def _start_heartbeat_thread(ctx) -> None:
 def register(ctx) -> None:
     register_hooks(ctx)
     register_commands(ctx)
-    # 注册 LLM 可调用的 agenda 工具（设计见 core_idea/core.md §4.8）
+
+    try:
+        from companion.meme_store import get_meme_manager
+
+        manager = get_meme_manager()
+        manager.ensure_pack(manager.default_pack_id)
+        logger.info("meme manager ready: %s", manager.get_default_memes_dir())
+    except Exception as e:
+        logger.warning("meme manager init failed: %s", e)
+
     try:
         register_tools(ctx)
     except Exception as e:
         logger.warning("agenda 工具注册失败: %s", e)
-    # 启动每日自动归档线程（幂等）。HERMES_COMPANION_AUTO_ARCHIVE=0 可关闭。
+
     try:
         from companion.world_state import start_daily_archiver
+
         start_daily_archiver()
     except Exception as e:
         logger.warning("daily archiver 启动失败: %s", e)
+
     if _heartbeat_enabled():
         try:
             if _cron_delivery_enabled():
