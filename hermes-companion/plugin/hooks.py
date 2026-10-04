@@ -1,13 +1,3 @@
-"""
-Hermes Companion 插件 hooks。
-
-挂载点：
-  - pre_llm_call    每 turn LLM 调用前注入 [时间 + 情感状态 + 待发主动消息]
-  - post_llm_call   每 turn 完成后调用辅助 LLM 推断情感更新（v0.4，节流+后台线程）
-  - post_tool_call  工具失败时小幅降低 valence
-  - on_session_start 仅打日志，便于排查插件加载
-"""
-
 from __future__ import annotations
 
 import json
@@ -16,8 +6,9 @@ import logging
 from companion.emotion_inference import schedule_inference
 from companion.emotion_state import load_emotion_state, nudge_emotion
 from companion.heartbeat import drain_pending
-from companion.world_interaction import observe_interaction
+from companion.meme_store import get_meme_manager
 from companion.time_context import format_current_time
+from companion.world_interaction import observe_interaction
 from companion.world_state import format_today_brief, roll_over_if_new_day
 
 logger = logging.getLogger(__name__)
@@ -25,11 +16,18 @@ logger = logging.getLogger(__name__)
 
 # --- pre_llm_call -----------------------------------------------------------
 
-def on_pre_llm_call(*, session_id: str = "", user_message: str = "",
-                    conversation_history=None, is_first_turn: bool = False,
-                    model: str = "", platform: str = "", sender_id: str = "",
-                    **kwargs) -> dict:
-    """返回 {"context": "..."}，被 append 到当前 turn 的 user message 末尾。"""
+def on_pre_llm_call(
+    *,
+    session_id: str = "",
+    user_message: str = "",
+    conversation_history=None,
+    is_first_turn: bool = False,
+    model: str = "",
+    platform: str = "",
+    sender_id: str = "",
+    **kwargs,
+) -> dict:
+    """返回 {\"context\": ...}，被 append 到当前 turn 的 user message 末尾。"""
     parts: list[str] = [format_current_time()]
 
     try:
@@ -38,8 +36,6 @@ def on_pre_llm_call(*, session_id: str = "", user_message: str = "",
         logger.warning("emotion 注入失败: %s", e)
 
     try:
-        # 顺手触发跨日归档（幂等，cheap）。即使没有 heartbeat 进程在跑，
-        # 任何 hermes 交互都会保证 events.json 不会停留在旧日期。
         roll_over_if_new_day()
         brief = format_today_brief()
         if brief:
@@ -54,15 +50,29 @@ def on_pre_llm_call(*, session_id: str = "", user_message: str = "",
     except Exception as e:
         logger.warning("pending 注入失败: %s", e)
 
+    try:
+        manager = get_meme_manager()
+        meme_block = manager.format_prompt_block()
+        if meme_block:
+            parts.append(meme_block)
+    except Exception as e:
+        logger.warning("meme 注入失败: %s", e)
+
     return {"context": "\n\n".join(parts)}
 
 
 # --- post_llm_call (v0.4 emotion inference) ---------------------------------
 
-def on_post_llm_call(*, session_id: str = "", user_message: str = "",
-                     assistant_response: str = "",
-                     conversation_history=None, model: str = "",
-                     platform: str = "", **kwargs) -> None:
+def on_post_llm_call(
+    *,
+    session_id: str = "",
+    user_message: str = "",
+    assistant_response: str = "",
+    conversation_history=None,
+    model: str = "",
+    platform: str = "",
+    **kwargs,
+) -> None:
     """每 turn 完成后异步推断情感状态更新。永不阻塞。"""
     try:
         schedule_inference(
@@ -81,6 +91,14 @@ def on_post_llm_call(*, session_id: str = "", user_message: str = "",
         )
     except Exception as e:
         logger.warning("world_interaction 失败: %s", e)
+
+    try:
+        manager = get_meme_manager()
+        markers = manager.extract_markers(assistant_response)
+        if markers:
+            logger.info("detected meme markers: %s", markers)
+    except Exception as e:
+        logger.warning("meme marker parse failed: %s", e)
 
 
 # --- post_tool_call ---------------------------------------------------------
@@ -103,10 +121,17 @@ def _result_has_error(result) -> bool:
     return False
 
 
-def on_post_tool_call(*, tool_name: str = "", args=None, result=None,
-                      session_id: str = "", duration_ms: int = 0,
-                      task_id: str = "", tool_call_id: str = "",
-                      **kwargs) -> None:
+def on_post_tool_call(
+    *,
+    tool_name: str = "",
+    args=None,
+    result=None,
+    session_id: str = "",
+    duration_ms: int = 0,
+    task_id: str = "",
+    tool_call_id: str = "",
+    **kwargs,
+) -> None:
     if not _result_has_error(result):
         return
     try:
